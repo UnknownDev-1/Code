@@ -1,0 +1,9 @@
+discord.py>=2.7.1
+python-dotenv
+deep-translator
+ddgs
+yt-dlp
+BeautifulSoup
+beautifulsoup4
+Pillow
+chat-exporter
