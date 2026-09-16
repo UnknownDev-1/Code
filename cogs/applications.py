@@ -1,0 +1,1492 @@
+import discord
+from discord import app_commands
+from discord.ext import commands
+import json
+import os
+import asyncio
+import io
+import chat_exporter
+from datetime import datetime, timezone
+
+DATA_FILE = "applications.json"
+MAX_APPS = 5
+MAX_QUESTIONS = 12
+TIMEOUT_SECONDS = 3600
+
+COLOR_SUCCESS = 0x57F287
+COLOR_ERROR   = 0xED4245
+COLOR_INFO    = 0x5865F2
+COLOR_WARN    = 0xFEE75C
+COLOR_PENDING = 0x5865F2
+
+active_sessions: set[int] = set()
+
+
+def load_data() -> dict:
+    if not os.path.exists(DATA_FILE):
+        return {}
+    with open(DATA_FILE, "r") as f:
+        return json.load(f)
+
+def save_data(data: dict):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def get_guild_data(data: dict, guild_id: str) -> dict:
+    gd = data.setdefault(guild_id, {
+        "log_channel": None,
+        "reviewer_role": None,
+        "applications": {},
+        "panels": [],
+        "blacklisted_users": []
+    })
+    gd.setdefault("panels", [])
+    gd.setdefault("submissions", {})
+    gd.setdefault("ticket_log_channel", None)
+    gd.setdefault("tickets", {})
+    gd.setdefault("blacklisted_users", [])
+    return gd
+
+
+def simple_view(text: str, color: int = COLOR_INFO) -> discord.ui.LayoutView:
+    class _V(discord.ui.LayoutView):
+        container = discord.ui.Container(
+            discord.ui.TextDisplay(text),
+            accent_color=color
+        )
+    return _V()
+
+
+async def delete_messages(messages: list[discord.Message]):
+    return
+
+
+class PersistentSubmissionView(discord.ui.LayoutView):
+    def __init__(self, bot: commands.Bot, submission_id: str, content_text: str = "## 📋 Application"):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.submission_id = submission_id
+        self._status_display = discord.ui.TextDisplay("**Status:** ⏳ Pending")
+
+        accept_btn = discord.ui.Button(label="Accept", style=discord.ButtonStyle.success, custom_id=f"app_accept:{submission_id}")
+        accept_btn.callback = self.accept_callback
+        deny_btn = discord.ui.Button(label="Deny", style=discord.ButtonStyle.danger, custom_id=f"app_deny:{submission_id}")
+        deny_btn.callback = self.deny_callback
+        ticket_btn = discord.ui.Button(label="Open Ticket", style=discord.ButtonStyle.secondary, custom_id=f"app_ticket:{submission_id}")
+        ticket_btn.callback = self.ticket_callback
+
+        btn_row = discord.ui.ActionRow()
+        btn_row.add_item(accept_btn)
+        btn_row.add_item(deny_btn)
+        btn_row.add_item(ticket_btn)
+
+        container = discord.ui.Container(
+            discord.ui.TextDisplay(content_text),
+            discord.ui.Separator(visible=True),
+            self._status_display,
+            btn_row,
+            accent_color=COLOR_PENDING
+        )
+        self.add_item(container)
+
+    async def _get_submission(self, interaction: discord.Interaction):
+        data = load_data()
+        gd = get_guild_data(data, str(interaction.guild_id))
+        submission = gd.get("submissions", {}).get(self.submission_id)
+        if not submission:
+            await interaction.response.send_message(
+                view=simple_view("❌ Application submission data was not found.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return None
+        app = gd.get("applications", {}).get(submission.get("app_id"))
+        if not app:
+            await interaction.response.send_message(
+                view=simple_view("❌ The application for this submission no longer exists.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return None
+        guild = self.bot.get_guild(int(submission["guild_id"]))
+        if not guild:
+            await interaction.response.send_message(
+                view=simple_view("❌ Server could not be found.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return None
+        applicant = self.bot.get_user(int(submission["user_id"]))
+        if not applicant:
+            try:
+                applicant = await self.bot.fetch_user(int(submission["user_id"]))
+            except Exception:
+                await interaction.response.send_message(
+                    view=simple_view("❌ Applicant could not be found.", COLOR_ERROR),
+                    ephemeral=True
+                )
+                return None
+        log_channel = guild.get_channel(int(submission["log_channel_id"]))
+        if not log_channel:
+            await interaction.response.send_message(
+                view=simple_view("❌ Application log channel could not be found.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return None
+        return applicant, app, guild, log_channel, submission
+
+    async def _check_permission(self, interaction: discord.Interaction) -> bool:
+        data = load_data()
+        gd = get_guild_data(data, str(interaction.guild_id))
+        reviewer_role_id = gd.get("reviewer_role")
+        member = interaction.guild.get_member(interaction.user.id)
+        if member.guild_permissions.administrator:
+            return True
+        if reviewer_role_id and int(reviewer_role_id) in [r.id for r in member.roles]:
+            return True
+        await interaction.response.send_message(
+            view=simple_view("❌ You don't have permission to do this.", COLOR_ERROR),
+            ephemeral=True
+        )
+        return False
+
+    async def accept_callback(self, interaction: discord.Interaction):
+        if not await self._check_permission(interaction):
+            return
+        result = await self._get_submission(interaction)
+        if result:
+            applicant, app, guild, _, submission = result
+            if submission.get("status") != "pending":
+                await interaction.response.send_message(
+                    view=simple_view("❌ This application has already been reviewed.", COLOR_ERROR),
+                    ephemeral=True
+                )
+                return
+            await handle_decision(interaction, self, "accepted", applicant, app, guild, self.submission_id)
+
+    async def deny_callback(self, interaction: discord.Interaction):
+        if not await self._check_permission(interaction):
+            return
+        result = await self._get_submission(interaction)
+        if result:
+            applicant, app, guild, _, submission = result
+            if submission.get("status") != "pending":
+                await interaction.response.send_message(
+                    view=simple_view("❌ This application has already been reviewed.", COLOR_ERROR),
+                    ephemeral=True
+                )
+                return
+            await handle_decision(interaction, self, "denied", applicant, app, guild, self.submission_id)
+
+    async def ticket_callback(self, interaction: discord.Interaction):
+        if not await self._check_permission(interaction):
+            return
+        result = await self._get_submission(interaction)
+        if result:
+            applicant, app, _, log_channel, submission = result
+            await handle_ticket(interaction, applicant, app, log_channel)
+
+
+class PanelSelectView(discord.ui.LayoutView):
+    def __init__(self, apps: dict, guild: discord.Guild):
+        super().__init__(timeout=None)
+        self.guild = guild
+
+        options = [
+            discord.SelectOption(
+                label=a["name"],
+                value=aid,
+                description=a.get("description", "")[:100]
+            )
+            for aid, a in apps.items() if a.get("open", True)
+        ]
+
+        select = discord.ui.Select(
+            placeholder="Choose an application...",
+            options=options,
+            custom_id=f"panel_select:{guild.id}"
+        )
+        select.callback = self.on_select
+
+        select_row = discord.ui.ActionRow()
+        select_row.add_item(select)
+
+        container = discord.ui.Container(
+            discord.ui.TextDisplay("## 📋 Applications\nSelect an application below to apply."),
+            discord.ui.Separator(visible=True),
+            select_row,
+            accent_color=COLOR_INFO
+        )
+        self.add_item(container)
+
+    async def on_select(self, interaction: discord.Interaction):
+        app_id = interaction.data["values"][0]
+        data = load_data()
+        gd = get_guild_data(data, str(interaction.guild_id))
+        app = gd["applications"].get(app_id)
+
+        if not app or not app.get("open", True):
+            await interaction.response.send_message(
+                view=simple_view("❌ That application is no longer available.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return
+
+        if str(interaction.user.id) in gd.get("blacklisted_users", []):
+            await interaction.response.send_message(
+                view=simple_view("🚫 You are blacklisted from applying. You cannot apply for any application in this server.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return
+
+        if interaction.user.id in active_sessions:
+            await interaction.response.send_message(
+                view=simple_view("⚠️ You already have an application in progress. Complete or cancel it before starting a new one.", COLOR_WARN),
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            view=simple_view(f"📬 Check your DMs! Starting **{app['name']}** application.", COLOR_SUCCESS),
+            ephemeral=True
+        )
+        await start_dm_flow(interaction.user, interaction.guild, app_id, app)
+
+
+async def start_dm_flow(user: discord.Member, guild: discord.Guild, app_id: str, app: dict):
+    try:
+        dm = await user.create_dm()
+    except Exception:
+        return
+
+    class StartView(discord.ui.LayoutView):
+        def __init__(self_inner):
+            super().__init__(timeout=300)
+            self_inner.started = False
+            self_inner._msg = None
+
+            start_btn = discord.ui.Button(label="Start Application", style=discord.ButtonStyle.success)
+            start_btn.callback = self_inner.start_callback
+            close_btn = discord.ui.Button(label="Close", style=discord.ButtonStyle.danger)
+            close_btn.callback = self_inner.close_callback
+
+            btn_row = discord.ui.ActionRow()
+            btn_row.add_item(start_btn)
+            btn_row.add_item(close_btn)
+
+            container = discord.ui.Container(
+                discord.ui.TextDisplay(
+                    f"## 📝 {app['name']}\n"
+                    f"**Server:** {guild.name}\n\n"
+                    f"You have **60 minutes** to complete this application once you start.\n"
+                    f"Type `cancel` at any time to cancel.\n\n"
+                    f"*{len(app['questions'])} question(s) total*"
+                ),
+                discord.ui.Separator(visible=True),
+                btn_row,
+                accent_color=COLOR_INFO
+            )
+            self_inner.add_item(container)
+
+        async def on_timeout(self_inner):
+            for child in self_inner.walk_children():
+                if hasattr(child, 'disabled'):
+                    child.disabled = True
+            try:
+                if self_inner._msg:
+                    await self_inner._msg.edit(view=self_inner)
+            except Exception:
+                pass
+
+        async def start_callback(self_inner, interaction: discord.Interaction):
+            if self_inner.started:
+                return
+            self_inner.started = True
+            for child in self_inner.walk_children():
+                if hasattr(child, 'disabled'):
+                    child.disabled = True
+            await interaction.response.edit_message(view=self_inner)
+            await run_questions(interaction.user, interaction.channel, guild, app_id, app)
+
+        async def close_callback(self_inner, interaction: discord.Interaction):
+            for child in self_inner.walk_children():
+                if hasattr(child, 'disabled'):
+                    child.disabled = True
+            await interaction.response.edit_message(view=self_inner)
+            await interaction.followup.send(
+                view=simple_view("❌ Application closed.", COLOR_ERROR)
+            )
+
+    try:
+        view = StartView()
+        msg = await dm.send(view=view)
+        view._msg = msg
+    except discord.Forbidden:
+        pass
+
+
+async def run_questions(user: discord.User, dm_channel, guild: discord.Guild, app_id: str, app: dict):
+    active_sessions.add(user.id)
+    try:
+        await _run_questions_inner(user, dm_channel, guild, app_id, app)
+    finally:
+        active_sessions.discard(user.id)
+
+
+async def _run_questions_inner(user: discord.User, dm_channel, guild: discord.Guild, app_id: str, app: dict):
+    questions = app["questions"]
+    answers = []
+    start_time = datetime.now(timezone.utc)
+    bot_client = user._state._get_client()
+
+    tracked: list[discord.Message] = []
+
+    for i, question in enumerate(questions):
+        class QView(discord.ui.LayoutView):
+            container = discord.ui.Container(
+                discord.ui.TextDisplay(f"**Question {i+1}/{len(questions)}**\n\n{question}"),
+                accent_color=COLOR_INFO
+            )
+
+        q_msg = await dm_channel.send(view=QView())
+        tracked.append(q_msg)
+
+        def check(m: discord.Message):
+            return m.author.id == user.id and m.channel.id == dm_channel.id
+
+        remaining = TIMEOUT_SECONDS - int((datetime.now(timezone.utc) - start_time).total_seconds())
+        if remaining <= 0:
+            await delete_messages(tracked)
+            await dm_channel.send(view=simple_view("⏰ Time's up! Application automatically cancelled.", COLOR_ERROR))
+            return
+
+        try:
+            msg = await bot_client.wait_for("message", check=check, timeout=remaining)
+        except asyncio.TimeoutError:
+            await delete_messages(tracked)
+            await dm_channel.send(view=simple_view("⏰ Time's up! Application automatically cancelled.", COLOR_ERROR))
+            return
+
+        tracked.append(msg)
+
+        if msg.content.strip().lower() == "cancel":
+            await delete_messages(tracked)
+            await dm_channel.send(view=simple_view("❌ Application cancelled.", COLOR_ERROR))
+            return
+
+        answers.append(msg.content)
+
+    end_time = datetime.now(timezone.utc)
+    time_taken = int((end_time - start_time).total_seconds())
+    mins, secs = divmod(time_taken, 60)
+
+    qa_entries = []
+    for i, (q, a) in enumerate(zip(questions, answers), 1):
+        entry = f"**Q{i}.** {q}\n**A:** {a}"
+        if len(entry) > 3000:
+            entry = entry[:3000] + "... (truncated, full answer too long to display)"
+        qa_entries.append(entry)
+
+    header = f"## ✅ Application Summary : {app['name']}\n*Time taken: {mins}m {secs}s*"
+
+    chunks = []
+    current_lines = []
+    current_len = 0
+    for entry in qa_entries:
+        if current_len + len(entry) + 2 > 3200 and current_lines:
+            chunks.append("\n\n".join(current_lines))
+            current_lines = [entry]
+            current_len = len(entry)
+        else:
+            current_lines.append(entry)
+            current_len += len(entry) + 2
+    if current_lines:
+        chunks.append("\n\n".join(current_lines))
+
+    await delete_messages(tracked)
+
+    for idx, chunk in enumerate(chunks):
+        text = (header + "\n\n" + chunk) if idx == 0 else chunk
+        await dm_channel.send(view=simple_view(text, COLOR_SUCCESS))
+
+    class SubmitView(discord.ui.LayoutView):
+        def __init__(self_inner):
+            super().__init__(timeout=300)
+            self_inner._answers = answers
+            self_inner._start = start_time
+            self_inner._end = end_time
+            self_inner._msg = None
+
+            submit_btn = discord.ui.Button(label="Submit", style=discord.ButtonStyle.success)
+            submit_btn.callback = self_inner.submit_callback
+            cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.danger)
+            cancel_btn.callback = self_inner.cancel_callback
+
+            btn_row = discord.ui.ActionRow()
+            btn_row.add_item(submit_btn)
+            btn_row.add_item(cancel_btn)
+
+            container = discord.ui.Container(
+                discord.ui.TextDisplay("Ready to submit? Click **Submit** to send your application or **Cancel** to discard it."),
+                discord.ui.Separator(visible=True),
+                btn_row,
+                accent_color=COLOR_SUCCESS
+            )
+            self_inner.add_item(container)
+
+        async def on_timeout(self_inner):
+            for child in self_inner.walk_children():
+                if hasattr(child, 'disabled'):
+                    child.disabled = True
+            try:
+                if self_inner._msg:
+                    await self_inner._msg.edit(view=self_inner)
+            except Exception:
+                pass
+
+        async def submit_callback(self_inner, interaction: discord.Interaction):
+            for child in self_inner.walk_children():
+                if hasattr(child, 'disabled'):
+                    child.disabled = True
+            await interaction.response.edit_message(view=self_inner)
+            try:
+                await submit_application(user, guild, app_id, app, self_inner._answers, self_inner._start, self_inner._end)
+            except Exception:
+                pass
+            await interaction.followup.send(
+                view=simple_view(f"✅ Your application for **{app['name']}** has been submitted!", COLOR_SUCCESS)
+            )
+
+        async def cancel_callback(self_inner, interaction: discord.Interaction):
+            for child in self_inner.walk_children():
+                if hasattr(child, 'disabled'):
+                    child.disabled = True
+            await interaction.response.edit_message(view=self_inner)
+            await interaction.followup.send(view=simple_view("❌ Application cancelled.", COLOR_ERROR))
+
+    view = SubmitView()
+    msg = await dm_channel.send(view=view)
+    view._msg = msg
+
+
+async def submit_application(
+    user: discord.User,
+    guild: discord.Guild,
+    app_id: str,
+    app: dict,
+    answers: list,
+    start_time: datetime,
+    end_time: datetime
+):
+    data = load_data()
+    gd = get_guild_data(data, str(guild.id))
+    log_channel_id = gd.get("log_channel")
+    if not log_channel_id:
+        return
+
+    log_channel = guild.get_channel(int(log_channel_id))
+    if not log_channel:
+        return
+
+    time_taken = int((end_time - start_time).total_seconds())
+    mins, secs = divmod(time_taken, 60)
+    account_age = (datetime.now(timezone.utc) - user.created_at).days
+
+    submission_id = f"{user.id}_{int(end_time.timestamp())}"
+
+    header_text = (
+        f"## 📋 New Application : {app['name']}\n"
+        f"**Applicant:** {user.mention} (`{user.id}`)\n"
+        f"**Account Age:** {account_age} days\n"
+        f"**Time Taken:** {mins}m {secs}s\n"
+        f"**Submitted:** <t:{int(end_time.timestamp())}:F>"
+    )
+
+    PAGE_BODY_LIMIT = 3000
+
+    qa_entries = []
+    for i, (q, a) in enumerate(zip(app["questions"], answers), 1):
+        entry = f"**Q{i}.** {q}\n**A:** {a}"
+        qa_entries.append(entry)
+
+    pages = []
+    current = []
+    current_len = 0
+    for entry in qa_entries:
+        if len(entry) > PAGE_BODY_LIMIT:
+            if current:
+                pages.append("\n\n".join(current))
+                current = []
+                current_len = 0
+            for start in range(0, len(entry), PAGE_BODY_LIMIT):
+                pages.append(entry[start:start + PAGE_BODY_LIMIT])
+            continue
+        if current and current_len + len(entry) + 2 > PAGE_BODY_LIMIT:
+            pages.append("\n\n".join(current))
+            current = [entry]
+            current_len = len(entry)
+        else:
+            current.append(entry)
+            current_len += len(entry) + 2
+    if current:
+        pages.append("\n\n".join(current))
+
+    total_pages = len(pages)
+
+    page_texts = []
+    for idx, body in enumerate(pages, 1):
+        marker = f"**Page(s): {total_pages}**" if total_pages == 1 else f"**Page(s): {total_pages} ({idx}/{total_pages})**"
+        if idx == 1:
+            page_texts.append(f"{marker}\n{header_text}\n\n{body}")
+        else:
+            page_texts.append(f"{marker}\n**Continued : {app['name']} ({user.mention})**\n\n{body}")
+
+    class SubmissionView(discord.ui.LayoutView):
+        def __init__(self_inner, content_text: str):
+            super().__init__(timeout=None)
+            self_inner._status_display = discord.ui.TextDisplay("**Status:** ⏳ Pending")
+
+            accept_btn = discord.ui.Button(label="Accept", style=discord.ButtonStyle.success, custom_id=f"app_accept:{submission_id}")
+            accept_btn.callback = self_inner.accept_callback
+            deny_btn = discord.ui.Button(label="Deny", style=discord.ButtonStyle.danger, custom_id=f"app_deny:{submission_id}")
+            deny_btn.callback = self_inner.deny_callback
+            ticket_btn = discord.ui.Button(label="Open Ticket", style=discord.ButtonStyle.secondary, custom_id=f"app_ticket:{submission_id}")
+            ticket_btn.callback = self_inner.ticket_callback
+
+            btn_row = discord.ui.ActionRow()
+            btn_row.add_item(accept_btn)
+            btn_row.add_item(deny_btn)
+            btn_row.add_item(ticket_btn)
+
+            self_inner._container = discord.ui.Container(
+                discord.ui.TextDisplay(content_text),
+                discord.ui.Separator(visible=True),
+                self_inner._status_display,
+                btn_row,
+                accent_color=COLOR_PENDING
+            )
+            self_inner.add_item(self_inner._container)
+
+        async def _check_permission(self_inner, interaction: discord.Interaction) -> bool:
+            data = load_data()
+            gd = get_guild_data(data, str(interaction.guild_id))
+            reviewer_role_id = gd.get("reviewer_role")
+            member = interaction.guild.get_member(interaction.user.id)
+            if member.guild_permissions.administrator:
+                return True
+            if reviewer_role_id and int(reviewer_role_id) in [r.id for r in member.roles]:
+                return True
+            await interaction.response.send_message(
+                view=simple_view("❌ You don't have permission to do this.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return False
+
+        async def accept_callback(self_inner, interaction: discord.Interaction):
+            if not await self_inner._check_permission(interaction):
+                return
+            await handle_decision(interaction, self_inner, "accepted", user, app, guild, submission_id)
+
+        async def deny_callback(self_inner, interaction: discord.Interaction):
+            if not await self_inner._check_permission(interaction):
+                return
+            await handle_decision(interaction, self_inner, "denied", user, app, guild, submission_id)
+
+        async def ticket_callback(self_inner, interaction: discord.Interaction):
+            if not await self_inner._check_permission(interaction):
+                return
+            await handle_ticket(interaction, user, app, log_channel)
+
+    try:
+        submission_message = None
+        for idx, text in enumerate(page_texts, 1):
+            if idx == total_pages:
+                submission_message = await log_channel.send(view=SubmissionView(text))
+            else:
+                await log_channel.send(view=simple_view(text, COLOR_PENDING))
+
+        if submission_message:
+            gd.setdefault("submissions", {})[submission_id] = {
+                "user_id": str(user.id),
+                "guild_id": str(guild.id),
+                "app_id": str(app_id),
+                "log_channel_id": str(log_channel.id),
+                "message_id": str(submission_message.id),
+                "content_text": page_texts[-1],
+                "status": "pending"
+            }
+            save_data(data)
+    except Exception:
+        try:
+            await log_channel.send(view=simple_view(
+                f"⚠️ New application from {user.mention} for **{app['name']}** couldn't be posted in full, "
+                f"the answers were too long to display. Check with the applicant directly or review their DM confirmation.",
+                COLOR_ERROR
+            ))
+        except Exception:
+            pass
+
+
+async def handle_decision(
+    interaction: discord.Interaction,
+    view: discord.ui.LayoutView,
+    decision: str,
+    applicant: discord.User,
+    app: dict,
+    guild: discord.Guild,
+    submission_id: str = None
+):
+    class ReasonModal(discord.ui.Modal, title=f"{'Accept' if decision == 'accepted' else 'Deny'} Application"):
+        reason = discord.ui.TextInput(
+            label="Reason (optional)",
+            required=False,
+            style=discord.TextStyle.paragraph,
+            max_length=500
+        )
+
+        async def on_submit(self_modal, modal_interaction: discord.Interaction):
+            reason_text = self_modal.reason.value.strip() if self_modal.reason.value else None
+
+            for child in view.walk_children():
+                if hasattr(child, 'disabled'):
+                    child.disabled = True
+
+            emoji = "✅" if decision == "accepted" else "❌"
+            status_line = f"**Status:** {emoji} {decision.capitalize()} by {modal_interaction.user.mention}"
+            if reason_text:
+                status_line += f"\n**Reason:** {reason_text}"
+
+            for child in view.walk_children():
+                if isinstance(child, discord.ui.TextDisplay) and "Status" in (child.content or ""):
+                    child.content = status_line
+                    break
+
+            for child in view.walk_children():
+                if isinstance(child, discord.ui.Container):
+                    child.accent_color = COLOR_SUCCESS if decision == "accepted" else COLOR_ERROR
+                    break
+
+            if submission_id:
+                data = load_data()
+                gd = get_guild_data(data, str(guild.id))
+                submission = gd.get("submissions", {}).get(submission_id)
+                if submission:
+                    submission["status"] = decision
+                    save_data(data)
+
+            await modal_interaction.response.edit_message(view=view)
+
+            try:
+                data = load_data()
+                gd = get_guild_data(data, str(guild.id))
+                ticket_log_channel_id = gd.get("ticket_log_channel")
+                ticket_log_channel = guild.get_channel(int(ticket_log_channel_id)) if ticket_log_channel_id else None
+                if ticket_log_channel:
+                    reason_line = f"**Reason:** {reason_text}" if reason_text else "**Reason:** None provided"
+                    await ticket_log_channel.send(
+                        view=simple_view(
+                            f"## {'✅ Application Accepted' if decision == 'accepted' else '❌ Application Denied'}\n"
+                            f"**Applicant:** {applicant.mention} (`{applicant.id}`)\n"
+                            f"**Application:** {app['name']}\n"
+                            f"**Reviewed by:** {modal_interaction.user.mention} (`{modal_interaction.user.id}`)\n"
+                            f"**Time:** <t:{int(datetime.now(timezone.utc).timestamp())}:F>\n"
+                            f"{reason_line}",
+                            COLOR_SUCCESS if decision == 'accepted' else COLOR_ERROR
+                        ),
+                        allowed_mentions=discord.AllowedMentions.none()
+                    )
+            except Exception:
+                pass
+
+            dm_text = (
+                f"## {'✅ Accepted' if decision == 'accepted' else '❌ Denied'}\n"
+                f"Your application for **{app['name']}** has been **{decision}**.\n"
+                f"**Server:** {guild.name}"
+            )
+            if reason_text:
+                dm_text += f"\n**Reason:** {reason_text}"
+
+            try:
+                dm = await applicant.create_dm()
+                color = COLOR_SUCCESS if decision == "accepted" else COLOR_ERROR
+                await dm.send(view=simple_view(dm_text, color))
+            except discord.Forbidden:
+                pass
+
+    await interaction.response.send_modal(ReasonModal())
+
+
+async def handle_ticket(
+    interaction: discord.Interaction,
+    applicant: discord.User,
+    app: dict,
+    log_channel: discord.TextChannel
+):
+    data = load_data()
+    gd = get_guild_data(data, str(interaction.guild_id))
+    reviewer_role_id = gd.get("reviewer_role")
+    stage = "starting"
+
+    try:
+        ticket_category_id = gd.get("ticket_category")
+        ticket_category = None
+
+        if ticket_category_id:
+            ticket_category = interaction.guild.get_channel(int(ticket_category_id))
+
+        if ticket_category is None:
+            ticket_category = await interaction.guild.create_category(
+                "Application Tickets",
+                overwrites={
+                    interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False)
+                }
+            )
+            gd["ticket_category"] = str(ticket_category.id)
+            save_data(data)
+
+        stage = "creating private ticket channel"
+        overwrites = {
+            interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            applicant: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True
+            )
+        }
+
+        if reviewer_role_id:
+            reviewer_role = interaction.guild.get_role(int(reviewer_role_id))
+            if reviewer_role:
+                overwrites[reviewer_role] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True
+                )
+
+        ticket_channel = await interaction.guild.create_text_channel(
+            name=f"ticket-{applicant.name}-{app['name']}",
+            overwrites=overwrites,
+            category=ticket_category
+        )
+
+        ticket_created_at = datetime.now(timezone.utc)
+        gd.setdefault("tickets", {})[str(ticket_channel.id)] = {
+            "applicant_id": str(applicant.id),
+            "application": app["name"],
+            "created_by": str(interaction.user.id),
+            "created_at": ticket_created_at.isoformat()
+        }
+        save_data(data)
+
+        ticket_log_channel_id = gd.get("ticket_log_channel")
+        ticket_log_channel = interaction.guild.get_channel(int(ticket_log_channel_id)) if ticket_log_channel_id else None
+        if ticket_log_channel:
+            try:
+                await ticket_log_channel.send(
+                    view=simple_view(
+                        f"## 🎫 Ticket Created\n"
+                        f"**Applicant:** {applicant.mention} (`{applicant.id}`)\n"
+                        f"**Application:** {app['name']}\n"
+                        f"**Created by:** {interaction.user.mention} (`{interaction.user.id}`)\n"
+                        f"**Ticket:** {ticket_channel.mention}\n"
+                        f"**Created:** <t:{int(ticket_created_at.timestamp())}:F>",
+                        COLOR_INFO
+                    ),
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+            except Exception:
+                pass
+
+        ping_line = applicant.mention
+        if reviewer_role_id:
+            ping_line += f" <@&{reviewer_role_id}>"
+
+        class TicketView(discord.ui.LayoutView):
+            def __init__(self_inner):
+                super().__init__(timeout=None)
+
+                close_btn = discord.ui.Button(
+                    label="Close Ticket",
+                    style=discord.ButtonStyle.danger,
+                    custom_id=f"ticket_close:{ticket_channel.id}"
+                )
+                close_btn.callback = self_inner.close_ticket
+
+                btn_row = discord.ui.ActionRow()
+                btn_row.add_item(close_btn)
+
+                container = discord.ui.Container(
+                    discord.ui.TextDisplay(
+                        f"{ping_line}\n\n"
+                        f"## 🎫 Application Ticket\n"
+                        f"**Application:** {app['name']}\n"
+                        f"**Applicant:** {applicant.mention} (`{applicant.id}`)\n\n"
+                        f"Use this channel to communicate regarding this application."
+                    ),
+                    discord.ui.Separator(visible=True),
+                    btn_row,
+                    accent_color=COLOR_INFO
+                )
+                self_inner.add_item(container)
+
+            async def close_ticket(self_inner, interaction: discord.Interaction):
+                data = load_data()
+                gd = get_guild_data(data, str(interaction.guild_id))
+                reviewer_role_id = gd.get("reviewer_role")
+                member = interaction.guild.get_member(interaction.user.id)
+                is_reviewer = reviewer_role_id and int(reviewer_role_id) in [r.id for r in member.roles]
+                if not member.guild_permissions.administrator and not is_reviewer:
+                    await interaction.response.send_message(
+                        view=simple_view("❌ You don't have permission to close this ticket.", COLOR_ERROR),
+                        ephemeral=True
+                    )
+                    return
+                for child in self_inner.walk_children():
+                    if hasattr(child, 'disabled'):
+                        child.disabled = True
+                await interaction.response.edit_message(view=self_inner)
+                await interaction.followup.send(
+                    view=simple_view(f"🔒 Ticket closed by {interaction.user.mention}.", COLOR_WARN)
+                )
+
+                try:
+                    data = load_data()
+                    gd = get_guild_data(data, str(interaction.guild_id))
+                    ticket_info = gd.get("tickets", {}).get(str(ticket_channel.id), {})
+                    ticket_log_channel_id = gd.get("ticket_log_channel")
+                    ticket_log_channel = interaction.guild.get_channel(int(ticket_log_channel_id)) if ticket_log_channel_id else None
+
+                    if not ticket_log_channel:
+                        await interaction.followup.send(
+                            view=simple_view("❌ Ticket log channel is not configured. The ticket was not deleted.", COLOR_ERROR),
+                            ephemeral=True
+                        )
+                        return
+
+                    transcript = await chat_exporter.export(ticket_channel)
+                    if not transcript:
+                        await interaction.followup.send(
+                            view=simple_view("❌ Failed to generate the ticket transcript. The ticket was not deleted.", COLOR_ERROR),
+                            ephemeral=True
+                        )
+                        return
+
+                    transcript_file = discord.File(
+                        io.BytesIO(transcript.encode("utf-8")),
+                        filename=f"transcript-{ticket_channel.name}.html"
+                    )
+
+                    created_at = ticket_info.get("created_at")
+                    created_text = f"<t:{int(datetime.fromisoformat(created_at).timestamp())}:F>" if created_at else "Unknown"
+                    created_by_id = ticket_info.get("created_by")
+                    created_by = f"<@{created_by_id}> (`{created_by_id}`)" if created_by_id else "Unknown"
+                    deleted_at = datetime.now(timezone.utc)
+
+                    await ticket_log_channel.send(
+                        content=(
+                            f"## 🗑️ Ticket Deleted\n"
+                            f"**Applicant:** {applicant.mention} (`{applicant.id}`)\n"
+                            f"**Application:** {app['name']}\n"
+                            f"**Ticket:** `{ticket_channel.name}` (`{ticket_channel.id}`)\n"
+                            f"**Created by:** {created_by}\n"
+                            f"**Created:** {created_text}\n"
+                            f"**Deleted by:** {interaction.user.mention} (`{interaction.user.id}`)\n"
+                            f"**Deleted:** <t:{int(deleted_at.timestamp())}:F>"
+                        ),
+                        file=transcript_file,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+
+                    await ticket_channel.delete()
+
+                    gd.get("tickets", {}).pop(str(ticket_channel.id), None)
+                    save_data(data)
+                except Exception:
+                    await interaction.followup.send(
+                        view=simple_view("❌ Failed to log the ticket transcript. The ticket was not deleted.", COLOR_ERROR),
+                        ephemeral=True
+                    )
+
+        stage = "sending ticket message"
+        await ticket_channel.send(view=TicketView())
+
+        await interaction.response.send_message(
+            view=simple_view(f"✅ Ticket channel created: {ticket_channel.mention}", COLOR_SUCCESS),
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.response.send_message(
+            view=simple_view(
+                f"❌ Failed to create ticket thread.\n"
+                f"Stage: `{stage}`\n"
+                f"`{type(e).__name__}: {e}`",
+                COLOR_ERROR
+            ),
+            ephemeral=True
+        )
+
+
+class ManageView(discord.ui.LayoutView):
+    def __init__(self, guild_id: str):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+        self._build()
+
+    def _build(self):
+        self.clear_items()
+        data = load_data()
+        gd = get_guild_data(data, self.guild_id)
+        apps = gd["applications"]
+
+        create_btn = discord.ui.Button(label="➕ Create New", style=discord.ButtonStyle.success)
+        create_btn.callback = self.create_callback
+        btn_row = discord.ui.ActionRow()
+        btn_row.add_item(create_btn)
+
+        inner = [
+            discord.ui.TextDisplay(f"## ⚙️ Manage Applications\n**Applications:** {len(apps)}/{MAX_APPS}"),
+            discord.ui.Separator(visible=True),
+            btn_row
+        ]
+
+
+        if apps:
+            options = [
+                discord.SelectOption(
+                    label=a["name"],
+                    value=aid,
+                    description=f"{'🟢 Open' if a.get('open', True) else '🔴 Closed'} • {len(a['questions'])} questions"
+                )
+                for aid, a in apps.items()
+            ]
+            select = discord.ui.Select(placeholder="Select app to manage...", options=options)
+            select.callback = self.app_selected
+            select_row = discord.ui.ActionRow()
+            select_row.add_item(select)
+            inner.append(discord.ui.Separator(visible=False))
+            inner.append(select_row)
+
+        container = discord.ui.Container(*inner, accent_color=COLOR_INFO)
+        self.add_item(container)
+
+    async def create_callback(self, interaction: discord.Interaction):
+        data = load_data()
+        gd = get_guild_data(data, str(interaction.guild_id))
+        if len(gd["applications"]) >= MAX_APPS:
+            await interaction.response.send_message(
+                view=simple_view(f"❌ You've reached the limit of {MAX_APPS} applications. Delete one to create a new one.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(CreateAppModal(str(interaction.guild_id)))
+
+    async def app_selected(self, interaction: discord.Interaction):
+        app_id = interaction.data["values"][0]
+        data = load_data()
+        gd = get_guild_data(data, str(interaction.guild_id))
+        app = gd["applications"].get(app_id)
+        if not app:
+            await interaction.response.send_message(view=simple_view("❌ App not found.", COLOR_ERROR), ephemeral=True)
+            return
+        await interaction.response.send_message(
+            view=AppDetailView(str(interaction.guild_id), app_id, app),
+            ephemeral=True
+        )
+
+
+class AppDetailView(discord.ui.LayoutView):
+    def __init__(self, guild_id: str, app_id: str, app: dict):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+        self.app_id = app_id
+        self.app = app
+
+        status = "🟢 Open" if app.get("open", True) else "🔴 Closed"
+
+        edit_btn = discord.ui.Button(label="Edit Questions", style=discord.ButtonStyle.primary)
+        edit_btn.callback = self.edit_questions
+        toggle_label = "Close App" if app.get("open", True) else "Open App"
+        toggle_btn = discord.ui.Button(label=toggle_label, style=discord.ButtonStyle.secondary)
+        toggle_btn.callback = self.toggle_open
+        delete_btn = discord.ui.Button(label="Delete", style=discord.ButtonStyle.danger)
+        delete_btn.callback = self.delete_app
+
+        btn_row = discord.ui.ActionRow()
+        btn_row.add_item(edit_btn)
+        btn_row.add_item(toggle_btn)
+        btn_row.add_item(delete_btn)
+
+        container = discord.ui.Container(
+            discord.ui.TextDisplay(
+                f"## {app['name']}\n"
+                f"**Status:** {status}\n"
+                f"**Questions:** {len(app['questions'])}/{MAX_QUESTIONS}"
+            ),
+            discord.ui.Separator(visible=True),
+            btn_row,
+            accent_color=COLOR_INFO
+        )
+        self.add_item(container)
+
+    async def edit_questions(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(EditQuestionsModal(self.guild_id, self.app_id, self.app))
+
+    async def toggle_open(self, interaction: discord.Interaction):
+        data = load_data()
+        gd = get_guild_data(data, self.guild_id)
+        current = gd["applications"][self.app_id].get("open", True)
+        gd["applications"][self.app_id]["open"] = not current
+        save_data(data)
+        state = "opened" if not current else "closed"
+        await interaction.response.send_message(
+            view=simple_view(f"✅ Application **{self.app['name']}** has been {state}.", COLOR_SUCCESS),
+            ephemeral=True
+        )
+
+    async def delete_app(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            view=ConfirmDeleteView(self.guild_id, self.app_id, self.app["name"]),
+            ephemeral=True
+        )
+
+
+class ConfirmDeleteView(discord.ui.LayoutView):
+    def __init__(self, guild_id: str, app_id: str, app_name: str):
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+        self.app_id = app_id
+
+        confirm_btn = discord.ui.Button(label="Confirm Delete", style=discord.ButtonStyle.danger)
+        confirm_btn.callback = self.confirm
+        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary)
+        cancel_btn.callback = self.cancel
+
+        btn_row = discord.ui.ActionRow()
+        btn_row.add_item(confirm_btn)
+        btn_row.add_item(cancel_btn)
+
+        container = discord.ui.Container(
+            discord.ui.TextDisplay(f"⚠️ Are you sure you want to delete **{app_name}**? This cannot be undone."),
+            discord.ui.Separator(visible=True),
+            btn_row,
+            accent_color=COLOR_WARN
+        )
+        self.add_item(container)
+
+    async def confirm(self, interaction: discord.Interaction):
+        data = load_data()
+        gd = get_guild_data(data, self.guild_id)
+        if self.app_id in gd["applications"]:
+            del gd["applications"][self.app_id]
+            save_data(data)
+        for child in self.walk_children():
+            if hasattr(child, 'disabled'):
+                child.disabled = True
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(view=simple_view("✅ Application deleted.", COLOR_SUCCESS), ephemeral=True)
+
+    async def cancel(self, interaction: discord.Interaction):
+        for child in self.walk_children():
+            if hasattr(child, 'disabled'):
+                child.disabled = True
+        await interaction.response.edit_message(view=self)
+
+
+class CreateAppModal(discord.ui.Modal, title="Create Application"):
+    name = discord.ui.TextInput(label="Application Name", max_length=50)
+    description = discord.ui.TextInput(label="Description (optional)", required=False, max_length=100)
+    questions = discord.ui.TextInput(
+        label=f"Questions (one per line, max {MAX_QUESTIONS})",
+        style=discord.TextStyle.paragraph,
+        placeholder="What is your age?\nWhy do you want to join?\n...",
+        max_length=3000
+    )
+
+    def __init__(self, guild_id: str):
+        super().__init__()
+        self.guild_id = guild_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        q_list = [q.strip() for q in self.questions.value.strip().splitlines() if q.strip()]
+        if len(q_list) > MAX_QUESTIONS:
+            await interaction.response.send_message(
+                view=simple_view(f"❌ Too many questions. Max is {MAX_QUESTIONS}.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return
+        if not q_list:
+            await interaction.response.send_message(
+                view=simple_view("❌ You must provide at least one question.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return
+
+        data = load_data()
+        gd = get_guild_data(data, self.guild_id)
+        app_id = str(int(datetime.now(timezone.utc).timestamp()))
+        gd["applications"][app_id] = {
+            "name": self.name.value.strip(),
+            "description": self.description.value.strip() if self.description.value else "",
+            "questions": q_list,
+            "open": True
+        }
+        save_data(data)
+
+        await interaction.response.send_message(
+            view=simple_view(f"✅ Application **{self.name.value.strip()}** created with {len(q_list)} question(s).", COLOR_SUCCESS),
+            ephemeral=True
+        )
+
+
+class EditQuestionsModal(discord.ui.Modal, title="Edit Questions"):
+    questions = discord.ui.TextInput(
+        label=f"Questions (one per line, max {MAX_QUESTIONS})",
+        style=discord.TextStyle.paragraph,
+        max_length=3000
+    )
+
+    def __init__(self, guild_id: str, app_id: str, app: dict):
+        super().__init__()
+        self.guild_id = guild_id
+        self.app_id = app_id
+        self.questions.default = "\n".join(app.get("questions", []))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        q_list = [q.strip() for q in self.questions.value.strip().splitlines() if q.strip()]
+        if len(q_list) > MAX_QUESTIONS:
+            await interaction.response.send_message(
+                view=simple_view(f"❌ Too many questions. Max is {MAX_QUESTIONS}.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return
+        if not q_list:
+            await interaction.response.send_message(
+                view=simple_view("❌ Must have at least one question.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return
+
+        data = load_data()
+        gd = get_guild_data(data, self.guild_id)
+        gd["applications"][self.app_id]["questions"] = q_list
+        save_data(data)
+
+        await interaction.response.send_message(
+            view=simple_view(f"✅ Questions updated ({len(q_list)} question(s)).", COLOR_SUCCESS),
+            ephemeral=True
+        )
+
+
+class Applications(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    async def cog_load(self):
+        self.bot.loop.create_task(self._reregister_panels())
+        self.bot.loop.create_task(self._reregister_submissions())
+
+    async def _reregister_submissions(self):
+        await self.bot.wait_until_ready()
+        data = load_data()
+        for guild_id, gd in data.items():
+            for submission_id, submission in gd.get("submissions", {}).items():
+                if submission.get("status") != "pending":
+                    continue
+                try:
+                    content_text = submission.get("content_text")
+                    if not content_text:
+                        guild = self.bot.get_guild(int(guild_id))
+                        log_channel = guild.get_channel(int(submission["log_channel_id"])) if guild else None
+                        message = await log_channel.fetch_message(int(submission["message_id"])) if log_channel else None
+                        content_parts = []
+
+                        def collect_text(component):
+                            content = getattr(component, "content", None)
+                            if content:
+                                content_parts.append(content)
+                            for child in getattr(component, "children", []) or []:
+                                collect_text(child)
+
+                        if message:
+                            for component in message.components:
+                                collect_text(component)
+                        if content_parts:
+                            content_text = content_parts[0]
+                            submission["content_text"] = content_text
+                            save_data(data)
+
+                    view = PersistentSubmissionView(self.bot, submission_id, content_text or "## 📋 Application")
+                    self.bot.add_view(view, message_id=int(submission["message_id"]))
+                except Exception:
+                    pass
+
+    async def _reregister_panels(self):
+        await self.bot.wait_until_ready()
+        data = load_data()
+        for guild_id, gd in data.items():
+            guild = self.bot.get_guild(int(guild_id))
+            if not guild:
+                continue
+            panels = gd.get("panels", [])
+            if not panels:
+                continue
+            open_apps = {aid: a for aid, a in gd.get("applications", {}).items() if a.get("open", True)}
+            if not open_apps:
+                continue
+            for entry in panels:
+                try:
+                    view = PanelSelectView(open_apps, guild)
+                    self.bot.add_view(view, message_id=int(entry["message_id"]))
+                except Exception:
+                    pass
+
+    app_group = app_commands.Group(name="application", description="Manage server applications")
+
+    @app_group.command(name="setup", description="Set the application log, ticket log and reviewer role.")
+    @app_commands.guild_only()
+    @app_commands.describe(
+        log_channel="Channel where submitted applications will be posted",
+        ticket_log_channel="Channel for ticket, review and transcript logs",
+        reviewer_role="Role that can accept/deny applications"
+    )
+    async def setup(
+        self,
+        interaction: discord.Interaction,
+        log_channel: discord.TextChannel,
+        ticket_log_channel: discord.TextChannel,
+        reviewer_role: discord.Role
+    ):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                view=simple_view("❌ You need **Administrator** permission to use this.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return
+
+        data = load_data()
+        gd = get_guild_data(data, str(interaction.guild_id))
+        gd["log_channel"] = str(log_channel.id)
+        gd["ticket_log_channel"] = str(ticket_log_channel.id)
+        gd["reviewer_role"] = str(reviewer_role.id)
+        save_data(data)
+
+        await interaction.response.send_message(
+            view=simple_view(
+                f"✅ Setup complete!\n"
+                f"**Application Log Channel:** {log_channel.mention}\n"
+                f"**Ticket Log Channel:** {ticket_log_channel.mention}\n"
+                f"**Reviewer Role:** {reviewer_role.mention}",
+                COLOR_SUCCESS
+            ),
+            ephemeral=True
+        )
+
+    @app_group.command(name="manage", description="Create, edit, open, close or delete applications.")
+    @app_commands.guild_only()
+    async def manage(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                view=simple_view("❌ You need **Administrator** permission to use this.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            view=ManageView(str(interaction.guild_id)),
+            ephemeral=True
+        )
+
+    @app_group.command(name="panel", description="Send the application panel to a channel.")
+    @app_commands.guild_only()
+    @app_commands.describe(channel="Channel to send the panel to")
+    async def panel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                view=simple_view("❌ You need **Administrator** permission to use this.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return
+
+        data = load_data()
+        gd = get_guild_data(data, str(interaction.guild_id))
+        open_apps = {aid: a for aid, a in gd["applications"].items() if a.get("open", True)}
+
+        if not open_apps:
+            await interaction.response.send_message(
+                view=simple_view("❌ No open applications to display.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return
+
+        sent = await channel.send(view=PanelSelectView(open_apps, interaction.guild))
+        gd["panels"].append({"channel_id": str(channel.id), "message_id": str(sent.id)})
+        save_data(data)
+
+        await interaction.response.send_message(
+            view=simple_view(f"✅ Panel sent to {channel.mention}.", COLOR_SUCCESS),
+            ephemeral=True
+        )
+
+    @commands.command(name="blacklist")
+    @commands.guild_only()
+    async def blacklist(self, ctx: commands.Context, member: discord.Member):
+        data = load_data()
+        gd = get_guild_data(data, str(ctx.guild.id))
+        reviewer_role_id = gd.get("reviewer_role")
+        is_reviewer = reviewer_role_id and int(reviewer_role_id) in [r.id for r in ctx.author.roles]
+
+        if not ctx.author.guild_permissions.administrator and not is_reviewer:
+            await ctx.send(view=simple_view("❌ You don't have permission to do this.", COLOR_ERROR))
+            return
+
+        blacklisted = gd.setdefault("blacklisted_users", [])
+        if str(member.id) in blacklisted:
+            await ctx.send(view=simple_view(f"⚠️ {member.mention} is already blacklisted.", COLOR_WARN))
+            return
+
+        blacklisted.append(str(member.id))
+        save_data(data)
+        await ctx.send(view=simple_view(f"🚫 {member.mention} has been blacklisted from applying for any application.", COLOR_SUCCESS))
+
+    @commands.command(name="unblacklist")
+    @commands.guild_only()
+    async def unblacklist(self, ctx: commands.Context, member: discord.Member):
+        data = load_data()
+        gd = get_guild_data(data, str(ctx.guild.id))
+        reviewer_role_id = gd.get("reviewer_role")
+        is_reviewer = reviewer_role_id and int(reviewer_role_id) in [r.id for r in ctx.author.roles]
+
+        if not ctx.author.guild_permissions.administrator and not is_reviewer:
+            await ctx.send(view=simple_view("❌ You don't have permission to do this.", COLOR_ERROR))
+            return
+
+        blacklisted = gd.setdefault("blacklisted_users", [])
+        if str(member.id) not in blacklisted:
+            await ctx.send(view=simple_view(f"⚠️ {member.mention} is not blacklisted.", COLOR_WARN))
+            return
+
+        blacklisted.remove(str(member.id))
+        save_data(data)
+        await ctx.send(view=simple_view(f"✅ {member.mention} has been unblacklisted and can apply again.", COLOR_SUCCESS))
+
+    @app_group.command(name="panel_edit", description="Refresh an existing application panel to reflect current apps.")
+    @app_commands.guild_only()
+    @app_commands.describe(channel="Channel the panel message is in", message_id="Message ID of the panel to refresh")
+    async def panel_edit(self, interaction: discord.Interaction, channel: discord.TextChannel, message_id: str):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                view=simple_view("❌ You need **Administrator** permission to use this.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return
+
+        try:
+            message = await channel.fetch_message(int(message_id))
+        except (ValueError, discord.NotFound, discord.Forbidden, discord.HTTPException):
+            await interaction.response.send_message(
+                view=simple_view("❌ Couldn't find that message in that channel.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return
+
+        if message.author.id != self.bot.user.id:
+            await interaction.response.send_message(
+                view=simple_view("❌ That message wasn't sent by this bot.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return
+
+        data = load_data()
+        gd = get_guild_data(data, str(interaction.guild_id))
+        open_apps = {aid: a for aid, a in gd["applications"].items() if a.get("open", True)}
+
+        if not open_apps:
+            await interaction.response.send_message(
+                view=simple_view("❌ No open applications to display.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return
+
+        new_view = PanelSelectView(open_apps, interaction.guild)
+        try:
+            await message.edit(view=new_view)
+        except discord.HTTPException as e:
+            await interaction.response.send_message(
+                view=simple_view(f"❌ Failed to edit panel.\n`{e}`", COLOR_ERROR),
+                ephemeral=True
+            )
+            return
+
+        already_tracked = any(
+            p["channel_id"] == str(channel.id) and p["message_id"] == str(message.id)
+            for p in gd["panels"]
+        )
+        if not already_tracked:
+            gd["panels"].append({"channel_id": str(channel.id), "message_id": str(message.id)})
+            save_data(data)
+
+        self.bot.add_view(new_view, message_id=message.id)
+
+        await interaction.response.send_message(
+            view=simple_view("✅ Panel refreshed with current applications.", COLOR_SUCCESS),
+            ephemeral=True
+        )
+
+    @app_commands.command(name="apply", description="Apply for a specific application.")
+    @app_commands.guild_only()
+    @app_commands.describe(application="The application to apply for")
+    async def apply(self, interaction: discord.Interaction, application: str):
+        data = load_data()
+        gd = get_guild_data(data, str(interaction.guild_id))
+
+        if str(interaction.user.id) in gd.get("blacklisted_users", []):
+            await interaction.response.send_message(
+                view=simple_view("🚫 You are blacklisted from applying. You cannot apply for any application in this server.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return
+
+        if interaction.user.id in active_sessions:
+            await interaction.response.send_message(
+                view=simple_view("⚠️ You already have an application in progress. Complete or cancel it before starting a new one.", COLOR_WARN),
+                ephemeral=True
+            )
+            return
+
+        matched_id = None
+        matched_app = None
+        for aid, a in gd["applications"].items():
+            if a["name"].lower() == application.lower():
+                matched_id = aid
+                matched_app = a
+                break
+
+        if not matched_app:
+            await interaction.response.send_message(
+                view=simple_view("❌ Application not found.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return
+
+        if not matched_app.get("open", True):
+            await interaction.response.send_message(
+                view=simple_view("❌ This application is currently closed.", COLOR_ERROR),
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            view=simple_view(f"📬 Check your DMs! Starting **{matched_app['name']}** application.", COLOR_SUCCESS),
+            ephemeral=True
+        )
+        await start_dm_flow(interaction.user, interaction.guild, matched_id, matched_app)
+
+    @apply.autocomplete("application")
+    async def apply_autocomplete(self, interaction: discord.Interaction, current: str):
+        data = load_data()
+        gd = get_guild_data(data, str(interaction.guild_id))
+        return [
+            app_commands.Choice(name=a["name"], value=a["name"])
+            for a in gd["applications"].values()
+            if a.get("open", True) and current.lower() in a["name"].lower()
+        ][:25]
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(Applications(bot))
